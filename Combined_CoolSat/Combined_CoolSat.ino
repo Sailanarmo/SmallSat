@@ -1,6 +1,6 @@
-#include <uCamII.h>
-#include <SPI.h>
+#include <uCamII.h>#include <SPI.h>
 #include <SD.h>
+
 #include <Wire.h>
 #include "Adafruit_MCP9808.h"
 #include "I2Cdev.h"
@@ -14,12 +14,18 @@ const int buttonPinCam = 24;     // the number of the pushbutton pin for Camera
 const int ledPinCam =  26;      // the number of the LED pin for Camera
 const int buttonPinTemp = 23;   // the number of the pushbutton pin for Temp Sensor
 const int ledPinTemp = 25;      // the number of the LED pin for the Temp Sensor
-const int buttonPinGy = 28;
+const int buttonPinGy = 28;   
 const int ledPinGy = 27;
+const int lightSensorPin = 15;  //light sensor pin.
+
+const int boomSwitchPin = 30; // the number of the pushbutton pin for boom switch
+
+const int wireCutter = 29;
 
 int buttonStateCam = 0;         // variable for reading the pushbutton status for Camera
 int buttonStateTemp = 0;        // variable for reading the pushbutton status for Temperature
 int buttonStateGy = 0;
+int boomSwitchState = 0;        
 
 String tempData = "Temp_0.txt"; // initializer? for text file for Temperature
 String pic = "Pic_0.txt";       // initializer? for text file for Picture
@@ -43,10 +49,14 @@ void setup() {
   pinMode(ledPinCam, OUTPUT);  // initialize the LED pin as an output:
   pinMode(ledPinTemp, OUTPUT); // for Temp Sensor Initialization
   pinMode(ledPinGy, OUTPUT);
+  pinMode(wireCutter, OUTPUT); //for the wire cutter
+ 
   
   pinMode(buttonPinCam, INPUT);  // initialize the pushbutton pin as an input:
   pinMode(buttonPinTemp, INPUT); // for Temp Sensor Initialization
-  pinMode(buttonPinGy, INPUT);
+  pinMode(buttonPinGy, INPUT);  
+  pinMode(boomSwitchPin, INPUT); // for the Boom Switch
+  
 
   delay(5000); 
   
@@ -97,12 +107,17 @@ void loop(){
   short x = 0;
   int bytes = 0; 
   int start = 0;
+
+  bool lightSensor = false;
+
+  float lightReading = 0.0;
   
   
 
   buttonStateCam = digitalRead(buttonPinCam); // reading the states of the buttons?
   buttonStateTemp = digitalRead(buttonPinTemp);
   buttonStateGy = digitalRead(buttonPinGy);
+  boomSwitchState = digitalRead(boomSwitchPin);
 
     // Camera Function
     if (buttonStateCam == LOW) //if LED is off, wait for picture to take
@@ -173,6 +188,9 @@ void loop(){
   
       digitalWrite(ledPinTemp, LOW); // Turn the LED OFF to tell us it's done recording data.
       tempData[5] = tempData[5] + 1;  // increments the file so we can have more than one text file.
+
+      lightSensor = true;
+
       // TODO: add something here that will delete a text file if it's reached more than n (n will be what we decide) files.
   }
 
@@ -225,4 +243,36 @@ void loop(){
       Accel[5] = Accel[5] +1;
       
   } 
+
+  if (boomSwitchState == HIGH){
+    // turn Cutter on:
+    digitalWrite(wireCutter, HIGH);
+    Serial.println("On");
+
+    delay(3000);
+    
+    // turn LED off:
+    digitalWrite(wireCutter, LOW);
+    Serial.println("Off");
+
+    delay(5000);
+  }
+
+  if (lightSensor == true){
+    for(int i = 0; i < 5; ++i){
+    lightReading = analogRead(lightSensorPin);
+    lightReading = lightReading * .0049;
+    if (lightReading > 1){ 
+      Serial.print(lightReading);
+      Serial.println(" Volts.");
+      Serial.println("The Sun is up.");
+      } else {
+        Serial.print(lightReading);
+        Serial.println(" Volts.");
+        Serial.println("The Sun is down.");
+      }
+      delay(2000);
+    }
+    lightSensor = false;
+  }
 }
