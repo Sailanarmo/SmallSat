@@ -6,63 +6,91 @@
 #include <DS1307RTC.h>
 #include "Adafruit_MCP9808.h"
 #include "I2Cdev.h"
-#include "MPU6050.h"
+#include <CoolSatBaro.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
 
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-  #include "Wire.h"
+#define BaroAddress 0x76 //defining the address for the Barometor?
+
+#define BNO055_SAMPLERATE_DELAY_MS (100) //Delay for the Gyro
+
+
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE //Not sure why this is needed
+#include "Wire.h"
 #endif
 
+//=========== Creating Instances of our sensors ==========//
+UCAMII camera;  //instance for the camera
+Adafruit_MCP9808 tempsensor = Adafruit_MCP9808(); //instance for the outer temperature sensor
+Adafruit_MCP9808 tempsensor2 = Adafruit_MCP9808(); //instance for the inner temperature sensor
+Adafruit_BNO055 bno = Adafruit_BNO055(); //instance for the Gyro
+CoolSatBaro myBaro; //instance for the barometer 
+//========================================================//
 
-UCAMII camera;
-Adafruit_MCP9808 tempsensor = Adafruit_MCP9808();
-Adafruit_MCP9808 tempsensor2 = Adafruit_MCP9808();
-MPU6050 accelgyro;
+//#define OUTPUT_READABLE_ACCELGYRO
 
-#define OUTPUT_READABLE_ACCELGYRO
-
+//================ Text Files ==================//
 File myGyro;
 File myAccel;
 File myFile;
 File myTemp;
 File myTemp2;
 File myLight;
+File myBarotxt;
+File dummy;
+//=============================================//
 
-tmElements_t tm;
+tmElements_t tm; //in the time library somewhere this is called.
 
+//===================== Global Variables =======================//
+const int wireCutter = 12; //pin for our wire cutter
+const int boomSwitch = 30;
+const long OneSec = 995;  //time for 1 second
+const long FiveMin = 299995;  //time for 5 minutes
+unsigned long previousMillis = 0; //reset the time 
+unsigned long previousStamp = 0;  //reset the time
 
-const int wireCutter = 29;
-
-const long INTERVAL = 995;
-const long STAMP = 299995;
-unsigned long previousMillis = 0;
-unsigned long previousStamp = 0;
-
-byte serialReadCommand;
+byte serialReadCommand; //needed so the Arduino can read commands sent through the Radio.
 
 bool commandSent = false;
 bool commandSent2 = false;
 bool commandSent3 = false;
+bool takePicture = false; //setting to false so it will only activate for the fail safe.
+bool printheader = false; // bool so header in file only prints one time
+bool printTemp1Header = false; // bool so header in file only prints one time
+bool printTemp2Header = false; // bool so header in file only prints one time
+bool printGyroHeader = false; // bool so header in file only prints one time
+bool printAccelHeader = false; // bool so header in file only prints one time
 
-int16_t ax, ay, az;
-int16_t gx, gy, gz;
+int lightPin = 15; //Light sensor pin, should change the name
+int batteryPin = 0;  //Battery reading pin
 
-int analogPin = 15;
-const int chipSelect = 22;
+const int chipSelect = 53; //enable for SD card
 
-float val = 0.0;
-float RLDR = 0.0;
-float Lux = 0.0;
+float val = 0.0;  //Voltage
+float RLDR = 0.0; //Resistance in Ohms
+float Lux = 0.0;  //Lux reading
+float battery = 0.0;  //Battery Voltage
+//==============================================================//
 
 void setup() {
-  //Serial.begin(115200);
-  Serial3.begin(9600);
+  //Serial.begin(9600);
+  Serial3.begin(9600);  //Initiating the Serial port to push out the the Radio
+  Wire.begin(); //Begining everying on our I2C Bus
 
-  pinMode(wireCutter, OUTPUT);
+  myBaro.initial(BaroAddress);  //Passing the address to initialize the Barometer
+  // Disable internal pullups, 10Kohms are on the breakout
+  PORTC |= (1 << 4);
+  PORTC |= (1 << 5);
+
+  pinMode(wireCutter, OUTPUT);  //Initializing our wirecutter
+  pinMode(boomSwitch, INPUT);   //Initializing our Boom Switch
   
   //Serial.print("Initializing SD card..."); // Initiallizes SD Card in Port 22.
   Serial3.print("Initializing SD card...");
 
-  if (!SD.begin(22)) 
+  if (!SD.begin(chipSelect)) 
   {
     //Serial.println("initialization failed!"); //if initialization of SD Card fails, should stop here.
     Serial3.println("initialization failed!");
@@ -72,7 +100,8 @@ void setup() {
   Serial3.println("initialization done.");
   //Serial.println("");
   Serial3.println("");
-
+  
+  //initializing our temperature sensors
 if (!tempsensor.begin()) {
     //Serial.println("Couldn't find MCP9808!");
     while (1);
@@ -82,132 +111,213 @@ if (!tempsensor2.begin2()) {
     while (1);
   }
 
-  //Serial.println("Initializing I2C devices...");
-  Serial3.println("Initializing I2C devices...");
-  accelgyro.initialize();
-
-  // verify connection
-  //Serial.println("Testing device connections...");
-  Serial3.println("Testing device connections...");
-  //Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
-  Serial3.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
-
-
+//initializing the Barometer
+if(!bno.begin())
+  {
+    /* There was a problem detecting the BNO055 ... check your connections */
+    Serial.print("Ooops, no BNO055 detected ... Check your wiring or I2C ADDR!");
+    while(1);
+  }
+  
+  bno.setExtCrystalUse(true);
+  
 }
 
 
 void loop() {
-  unsigned long currentMillis = millis();
+  unsigned long currentMillis = millis(); //millis() is a function for the arduino
   unsigned long timeMillis = millis();
   int bytes = 0;
-  bool cameraInit = false;
+  bool cameraInit = false;  //we have the camera not initialized so it will only respond once we send it a command
+  unsigned long counter = 0; 
 
+  runGyroSensor();  //Runs the Gyro in the "background" it's not really "tasking" but it runs whenever the other sensors are not running.
 
-  runGyroSensor();
-
+  //Enabling the arduino to read whatever commands is sent through the Radio.
   if(Serial3.available()){
     serialReadCommand = Serial3.read();
+    Serial3.println("");
+    Serial3.println("");
     Serial3.write(serialReadCommand);
+    Serial3.println("");
 
+  //If 1 is pressed, taked a picture
   if (serialReadCommand == 49 && !commandSent){
     commandSent = true;
     Serial3.println("Attempting to take Picture...");
     }
 
-  if (serialReadCommand == 50 && !commandSent2){
-    commandSent2 = true;
-    Serial3.println("Activating Wire Cutters...");  
+  //if 9 is pressed, activate the Wire Cutters
+  if (serialReadCommand == 57 && !commandSent2){
+      Serial3.println("**************");
+      Serial3.println("ABOUT TO ACTIVATE THE WIRE CUTTERS, ARE YOU SURE YOU WANT TO DO THIS?!?! Press y for Confirmation");
+      Serial3.println("**************");
+      while(counter < 60000){
+        serialReadCommand = Serial3.read();
+        if(serialReadCommand == 121){
+          commandSent2 = true;
+          Serial3.println("WIRE CUTTERS ACTIVATED!!!");
+          break;
+        }
+        Serial.println(counter++);
+      }  
     }
 
+  //If 3 is pressed, send us a text file of our data.
   if (serialReadCommand == 51 && !commandSent3){
     commandSent3 = true;
     Serial3.println("Sending you a text file, standby...");  
     }
   }
-  if (currentMillis - previousMillis >= INTERVAL){
+  
+  //If you hit 1 second, purge yourself and then do the following. 
+  if (currentMillis - previousMillis >= OneSec){
     previousMillis = currentMillis;
-
-    myLight = SD.open("Light.txt", FILE_WRITE);
-    val = analogRead(analogPin);
-    val = val * .0049; 
-
-    RLDR = (1000.0 * (5 - val))/val;
-    Lux = (776897.0 * (pow(RLDR, -1.206)));
     
+    //Checking to see if a command has been sent through the radio.
+    if (commandSent){
+      runCamera();
+      commandSent = false;
+      Serial3.println("");
+      Serial3.println("");
+    }
+    if (commandSent2){
+      cutWire();
+      commandSent2 = false;
+      Serial3.println("");
+      Serial3.println("");
+    }
+    if (commandSent3){
+      sendText();
+      commandSent3 = false;
+      Serial3.println("");
+      Serial3.println("");      
+    }
+
+    myBaro.readBaro(); //Give me a reading of the pressure
+    
+    myBarotxt = SD.open("Baro.txt", FILE_WRITE);
+    myLight = SD.open("Light.txt", FILE_WRITE);
+
+    //=============== Math ==================//
+    val = analogRead(lightPin); //Read the value of the light sensor pin
+    val = val * .0048; //Convert to Voltage
+    battery = analogRead(batteryPin); //Read the value of the batter level sensor pin
+    battery = (battery * .00475) * 2; //Convert to voltage while taking the voltage divider circuit into the equation.
+
+    RLDR = (1000.0 * (5 - val))/val; //convert to Resistance in Ohms
+    Lux = (776897.0 * (pow(RLDR, -1.206))); //Convert to Lux
+    //=======================================//
+
+    //Print to the Radio and write to the SD Card
+
+    if(printheader == false){
+      //print header for Serial3(radio)
+      Serial3.println("");
+      Serial3.print("Lux\t");
+      Serial3.print("Batt Level\t");
+      Serial3.print("Barometor Temp\t");
+      Serial3.print("Actual Pressure(mb)\t");
+      Serial3.print("Corrected Pressure(mb)\t");
+      Serial3.print("Altitude\t");
+      Serial3.print("Temp Inner\t\t");
+      Serial3.print("Temp outer\t");
+      Serial3.print("Time\t\t");
+      Serial3.print("Date\t");
+      Serial3.println("");
+      Serial3.print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------");
+      Serial3.println("");
+      
+      //print header for myLight text file on SD card
+      myLight.print("Lux\t");
+      myLight.print("Volts\t");
+      myLight.print("Ohms\t\t");
+      myLight.print("Time\t\t");
+      myLight.print("Date\t");
+      myLight.println("");
+      
+      //print header for myBarotxt text file on SD card
+      myBarotxt.print("Barometor Temp\t\t");
+      myBarotxt.print("Actual Pressure(mb)\t");
+      myBarotxt.print("Corrected Pressure(mb)\t");
+      myBarotxt.print("Altitude\t");
+      myBarotxt.print("Time\t\t");
+      myBarotxt.print("Date\t");
+      myBarotxt.println("");
+      printheader = true;
+    }
+
+    //print values for Serial3(radio)
     Serial3.print(Lux);
-    Serial3.print(" Lux. ");
-    Serial3.print(RLDR);
-    Serial3.print(" Resistance Ohms. ");
-    Serial3.print(val);
-    Serial3.println(" Volts."); 
+    Serial3.print("\t");
+    Serial3.print(battery);
+    Serial3.print("\t\t");
+    Serial3.print(myBaro.getTemp());
+    Serial3.print("\t\t");
+    Serial3.print(myBaro.getPressure());
+    Serial3.print("\t\t\t");
+    Serial3.print(myBaro.getCorrectedPressure());
+    Serial3.print("\t\t\t");
+    Serial3.print(myBaro.getAltitude());
+    Serial3.print("\t\t");
+
+    //print values for myLight text file on SD card
     myLight.print(Lux);
-    myLight.print(" Lux. ");
-    myLight.print(RLDR);
-    myLight.print(" Resistance Ohms. ");
+    myLight.print("\t");
     myLight.print(val);
-    myLight.println(" Volts.");
+    myLight.print("\t");
+    myLight.print(RLDR);
+    myLight.print("\t\t");
+    timeStamp(myLight);
     myLight.close();
 
+    //print values for myBarotxt text file on SD card
+    myBarotxt.print(myBaro.getTemp());
+    myBarotxt.print("\t\t\t");
+    myBarotxt.print(myBaro.getPressure());
+    myBarotxt.print("\t\t\t");
+    myBarotxt.print(myBaro.getCorrectedPressure());
+    myBarotxt.print("\t\t\t");
+    myBarotxt.print(myBaro.getAltitude());
+    myBarotxt.print("\t\t");
+    timeStamp(myBarotxt);
+    myBarotxt.close();
+
+    //call temp sensor functions to read/print to radio and SD card
     tempSens1();
     tempSens2();
 
-  if (commandSent){
-    runCamera();
-    commandSent = false;
-      }
-  if (commandSent2){
-    cutWire();
-    commandSent2 = false;
+    //time stamp with dummy file name so time stamp will only print once to radio each pass
+    timeStamp(dummy);
+
+    //if statement for automated wire cut and picture take and send on radio
+    if(myBaro.getPressure() >= 724 && digitalRead(boomSwitch)){     // for testing only
+      cutWire();
     }
-  if (commandSent3){
-    sendText();
-    commandSent3 = false;      
-    }
+
+
   }
-  if (timeMillis - previousStamp >= STAMP){
-    previousStamp = timeMillis;
-
-    myLight = SD.open("Light.txt", FILE_WRITE);
-    val = analogRead(analogPin);
-    val = val * .0049; 
-
-    RLDR = (1000.0 * (5 - val))/val;
-    Lux = (776897.0 * (pow(RLDR, -1.206)));
-    
-    Serial3.print(Lux);
-    Serial3.print(" Lux. ");
-    Serial3.print(RLDR);
-    Serial3.print(" Resistance Ohms. ");
-    Serial3.print(val);
-    Serial3.println(" Volts."); 
-    myLight.print(Lux);
-    myLight.print(" Lux. ");
-    myLight.print(RLDR);
-    myLight.print(" Resistance Ohms. ");
-    myLight.print(val);
-    myLight.println(" Volts.");
-    timeStamp();
-    myLight.close();
-
-    tempSens1();
-    tempSens2();
+  if(takePicture == true){
+    if (timeMillis - previousStamp >= FiveMin){
+      previousStamp = timeMillis;
+      runCamera();
+    }
   }
 }
 
+//function to take a picture
 void runCamera() {
   int bytes = 0; 
   Serial1.begin(115200); // uCAM-II Default Baud Rate
  
   myFile = SD.open("Picture.txt", FILE_WRITE);
   myFile.println("Picture Begin...");
-  writeToSDCamera();
+  timeStamp(myFile);  
   
 
   bool cameraInit = 0;
 
   cameraInit = camera.init(); // Initializing the camera, this must be done every time or the camera will go to sleep forever. 
-    
-  // TODO add a loop that will loop 60 times, if it reaches 60, we should receive an error to try to initiaze the camera again.
 
   if(cameraInit == true){
   
@@ -225,9 +335,9 @@ void runCamera() {
     // while the bytes are getting the data? loop through.
     for (short x = 0; x < bytes; x++)
     {
-      Serial3.print("0x");
-      Serial3.print(camera.imgBuffer[x], HEX);
-      Serial3.print(" ");
+//      Serial3.print("0x");
+//      Serial3.print(camera.imgBuffer[x], HEX);  //uncomment if you want to see camera data over the radio when picture is taken
+//      Serial3.print(" ");                       //this was commented out because it take longer to get a picture if sent over the radio
       myFile.print("0x"); // printing out to the text file.
       myFile.print(camera.imgBuffer[x], HEX);
       myFile.print(" ");
@@ -236,14 +346,17 @@ void runCamera() {
   Serial3.println("");
   myFile.println("");
   myFile.println("End of picture.");
-  writeToSDCamera();
+  timeStamp(myFile);
   myFile.println("");
   Serial3.println("Done Downloading");
   }
   myFile.close(); //closing the text file.  
 }
 
+//function call for the wire cutter. Stays on for 3 seconds which is just enough to cut the wires.
 void cutWire() {
+  Serial3.println("");
+  Serial3.println("");
   Serial3.println("Wire cutter:");
   // turn Cutter on:
   digitalWrite(wireCutter, HIGH);
@@ -253,34 +366,75 @@ void cutWire() {
   // turn LED off:
   digitalWrite(wireCutter, LOW);
   Serial3.println("Off");
-  delay(5000);
+  delay(1000);
 
-  Serial3.println("Done cutting!!"); 
+  Serial3.println("Done cutting!!");
+  Serial3.println("");
+  Serial3.println(""); 
+
+  delay(20000);
+  runCamera();
+  runCamera();
+  runCamera();
+  runCamera();
+  runCamera();
+  sendText();
+  takePicture = true;
 }
 
 void runGyroSensor(){
 
   myGyro = SD.open("Gyro.txt", FILE_WRITE);
   myAccel = SD.open("Accel.txt", FILE_WRITE);
+
+  // Possible vector values can be:
+  // - VECTOR_ACCELEROMETER - m/s^2
+  // - VECTOR_MAGNETOMETER  - uT
+  // - VECTOR_GYROSCOPE     - rad/s
+  // - VECTOR_EULER         - degrees
+  // - VECTOR_LINEARACCEL   - m/s^2
+  // - VECTOR_GRAVITY       - m/s^2
+  imu::Vector<3> acceleration = bno.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
+
+
+  if(printGyroHeader == false){
+    myAccel.print(" m/s^2 "); myAccel.println(""); myAccel.print("X:\t\t"); myAccel.print(" Y:\t\t"); myAccel.print(" Z:\t\t"); myAccel.print("Time\t\t"); myAccel.print("Date"); myAccel.println("");
+    printGyroHeader = true;
+  }
+  /* Display the floating point data */
   
-  int z = 0;
+  myAccel.print(acceleration.x());
+  myAccel.print("\t\t");
+  myAccel.print(acceleration.y());
+  myAccel.print("\t\t");
+  myAccel.print(acceleration.z());
+  myAccel.print("\t\t");
+  timeStamp(myAccel);
+
   
-    accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz); 
-      
-    #ifdef OUTPUT_READABLE_ACCELGYRO
-      myAccel.print("Acceleration X, Y, Z: ");
-      myAccel.print(ax); myAccel.print(", ");
-      myAccel.print(ay); myAccel.print(", ");
-      myAccel.print(az); myAccel.println("");
-      
-      myGyro.print("Gyro X, Y, Z: ");
-      myGyro.print(gx); myGyro.print(", ");
-      myGyro.print(gy); myGyro.print(", ");
-      myGyro.print(gz); myGyro.println("");
-    #endif
+
+  imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+
+  
+
+  if(printAccelHeader == false){
+    myGyro.print(" Degrees. "); myGyro.println(""); myGyro.print("X:\t\t"); myGyro.print(" Y:\t\t"); myGyro.print(" Z:\t\t"); myGyro.print("Time\t\t"); myGyro.print("Date"); myGyro.println(""); 
+    printAccelHeader = true;
+  }
+    /* Display the floating point data */
+  
+  myGyro.print(euler.x());
+  myGyro.print("\t\t");
+  myGyro.print(euler.y());
+  myGyro.print("\t\t");
+  myGyro.print(euler.z());
+  myGyro.print("\t\t");
+  timeStamp(myGyro);
    
   myGyro.close();
   myAccel.close();
+
+  delay(BNO055_SAMPLERATE_DELAY_MS);
 }
 
 void tempSens1(){
@@ -288,11 +442,16 @@ void tempSens1(){
     float c = tempsensor.readTempC();
     float f = c * 9.0 / 5.0 + 32;  // conversion to Farenheight
     myTemp = SD.open("Temp1.txt", FILE_WRITE);
-    Serial3.print("Temp Inner: "); Serial3.print(c); Serial3.print("*C\t"); // Printing to the console
-    Serial3.print(f); Serial3.println("*F");
-    myTemp.print("Temp Inner: "); myTemp.print(c); myTemp.print("*C\t");  // Printing to the text file.
-    myTemp.print(f); myTemp.println("*F");
+
+    if(printTemp1Header == false){
+      myTemp.print("Temp Inner:\t"); myTemp.println(""); myTemp.print("*C\t"); myTemp.print("*F\t"); myTemp.print("Time\t\t"); myTemp.print("Date\t"); myTemp.println("");// Printing to the console 
+      printTemp1Header = true;
+    }
+    myTemp.print(c); myTemp.print("\t"); myTemp.print(f); myTemp.print("\t");   // Printing to the text file.
+    Serial3.print(c); Serial3.print("*C   "); Serial3.print(f); Serial3.print("*F   ");
+      
     delay(250);
+    timeStamp(myTemp);
     myTemp.close();
     tempsensor.shutdown_wake(1);
 }
@@ -303,11 +462,16 @@ void tempSens2(){
     float c = tempsensor2.readTempC();
     float f = c * 9.0 / 5.0 + 32;  // conversion to Farenheight
     myTemp2 = SD.open("Temp2.txt", FILE_WRITE);
-    Serial3.print("Temp Outer: "); Serial3.print(c); Serial3.print("*C\t");
-    Serial3.print(f); Serial3.println("*F");
-    myTemp2.print("Temp Outer: "); myTemp2.print(c); myTemp2.print("*C\t");  // Printing to the text file.
-    myTemp2.print(f); myTemp2.println("*F");
+
+    if(printTemp2Header == false){
+      myTemp2.print("Temp Outer:\t"); myTemp2.println(""); myTemp2.print("*C\t"); myTemp2.print("*F\t"); myTemp2.print("Time\t\t"); myTemp2.print("Date\t"); myTemp2.println("");  
+      printTemp2Header = true;
+    }
+    myTemp2.print(c); myTemp2.print("\t"); myTemp2.print(f); myTemp2.print("\t");   // Printing to the text file.
+    Serial3.print(c); Serial3.print("*C   "); Serial3.print(f); Serial3.print("*F   "); 
+    
     delay(300);
+    timeStamp(myTemp2);
     myTemp2.close();
     tempsensor2.shutdown_wake(1);
 }
@@ -330,77 +494,54 @@ void sendText(){
   Serial3.println("Done"); 
 }
 
-void writeToSDCamera(){
-    if (RTC.read(tm)) {
-    Serial3.print("Time: ");
-    myFile.print("Time: ");
-    print2digitsC(tm.Hour);
-    Serial3.write(':');
-    myFile.write(':');
-    print2digitsC(tm.Minute);
-    Serial3.write(':');
-    myFile.write(':');
-    print2digitsC(tm.Second);
-    Serial3.print(", Date: ");
-    myFile.print(", Date: ");
-    Serial3.print(tm.Day);
-    myFile.print(tm.Day);
-    Serial3.write('/');
-    myFile.write('/');
-    Serial3.print(tm.Month);
-    myFile.print(tm.Month);
-    Serial3.write('/');
-    myFile.write('/');
-    Serial3.print(tmYearToCalendar(tm.Year));
-    myFile.print(tmYearToCalendar(tm.Year));
-    Serial3.println();
-    myFile.println();
+void timeStamp(File file){
+  if (RTC.read(tm)){
+    if(file == dummy){
+      ////Serial3.print("Time: ");
+      print2digits(file, tm.Hour);
+      Serial3.write(':');
+      print2digits(file, tm.Minute);
+      Serial3.write(':');
+      print2digits(file, tm.Second);
+      Serial3.print("\t");
+      Serial3.print(tm.Day);
+      Serial3.write('/');
+      Serial3.print(tm.Month);
+      Serial3.write('/');
+      Serial3.print(tmYearToCalendar(tm.Year));
+      Serial3.println();
+    }else{
+      ////file.print("Time: ");
+      print2digits(file, tm.Hour);
+      file.write(':');
+      print2digits(file, tm.Minute);
+      file.write(':');
+      print2digits(file, tm.Second);
+      file.print("\t");
+      file.print(tm.Day);
+      file.write('/');
+      file.print(tm.Month);
+      file.write('/');
+      file.print(tmYearToCalendar(tm.Year));
+      file.println();
+    }
   }
 }
 
-void print2digitsC(int number) {
-  if (number >= 0 && number < 10) {
-    Serial3.write('0');
-    myFile.write('0');
-  }
-  Serial3.print(number);
-  myFile.print(number);
-}
-
-void timeStamp(){
-    if (RTC.read(tm)) {
-    Serial3.print("Time: ");
-    myLight.print("Time: ");
-    print2digitsL(tm.Hour);
-    Serial3.write(':');
-    myLight.write(':');
-    print2digitsL(tm.Minute);
-    Serial3.write(':');
-    myLight.write(':');
-    print2digitsL(tm.Second);
-    Serial3.print(", Date: ");
-    myLight.print(", Date: ");
-    Serial3.print(tm.Day);
-    myLight.print(tm.Day);
-    Serial3.write('/');
-    myLight.write('/');
-    Serial3.print(tm.Month);
-    myLight.print(tm.Month);
-    Serial3.write('/');
-    myLight.write('/');
-    Serial3.print(tmYearToCalendar(tm.Year));
-    myLight.print(tmYearToCalendar(tm.Year));
-    Serial3.println();
-    myLight.println();
+void print2digits(File file, int number){
+  if (number >= 0 && number < 10){
+    if(file == dummy){
+      Serial3.write('0');
+      Serial3.print(number);
+    }else{
+      file.write('0');
+      file.print(number);
+    }
+  }else{
+    if(file == dummy){
+      Serial3.print(number);
+    }else{  
+      file.print(number);
+    }
   }
 }
-
-void print2digitsL(int number) {
-  if (number >= 0 && number < 10) {
-    Serial3.write('0');
-    myLight.write('0');
-  }
-  Serial3.print(number);
-  myLight.print(number);
-}
-
